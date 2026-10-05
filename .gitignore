@@ -13,6 +13,7 @@ backend/node_modules/
 dist/
 frontend/dist/
 backend/dist/
+.next/
 
 # Python
 __pycache__/
