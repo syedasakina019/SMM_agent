@@ -12,6 +12,7 @@ Two responsibilities:
 """
 
 import logging
+import zoneinfo
 from datetime import datetime, timezone
 
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -29,20 +30,26 @@ logger = logging.getLogger(__name__)
 # LEGACY: best-time placeholder (Phase 1 / 2)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def get_best_posting_time() -> dict:
+def get_best_posting_time(timezone_str: str) -> dict:
     """
     Placeholder: general industry data ke mutabiq ek 'best time' deta hai.
     TODO (Phase 4): Isay Meta Insights API ke real data se replace karna hai.
     """
-    now = datetime.utcnow()
-    target = now.replace(hour=19, minute=0, second=0, microsecond=0)
-    if target < now:
-        target += timedelta(days=1)
+    tz = zoneinfo.ZoneInfo(timezone_str)
+    now_local = datetime.now(tz)
+    
+    # Target 7:00 PM (19:00) in the user's local timezone
+    target_local = now_local.replace(hour=19, minute=0, second=0, microsecond=0)
+    if target_local <= now_local:
+        target_local += timedelta(days=1)
 
+    # Convert that exact local time back to UTC so the DB/Scheduler can handle it
+    target_utc = target_local.astimezone(zoneinfo.ZoneInfo("UTC"))
+    
     return {
-        "suggested_time": target.isoformat(),
+        "suggested_time": target_utc.isoformat().replace("+00:00", "Z"),
         "reason": (
-            "Placeholder estimate (general best-practice time). "
+            f"Placeholder estimate (7:00 PM in {timezone_str}). "
             "Will be replaced with real audience-activity data in Phase 4."
         ),
     }
@@ -94,7 +101,7 @@ def check_due_posts() -> None:
             except Exception as exc:
                 result = {"success": False, "error": f"Unexpected error: {exc}"}
 
-            if result["success"]:
+            if result.get("success"):
                 post.status = "published"
                 post.published_at = datetime.utcnow()
                 post.external_post_id = result.get("external_id")
@@ -114,6 +121,74 @@ def check_due_posts() -> None:
         db.close()
 
 
+def check_due_scheduled_ads() -> None:
+    """
+    Checks for scheduled Ad campaigns whose start_date has arrived.
+    Ensures safe handling:
+    - If not published to Meta, publishes them (in PAUSED status by default).
+    - Never auto-activates spending or changes Meta payment settings.
+    """
+    from app.database.models import Ad
+    from app.agents.meta_ads_publisher import publish_ad_to_meta
+
+    db = SessionLocal()
+    try:
+        now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+        due_ads = (
+            db.query(Ad)
+            .filter(Ad.status == "scheduled")
+            .filter(Ad.start_date <= now_utc)
+            .all()
+        )
+
+        if not due_ads:
+            return
+
+        for ad in due_ads:
+            logger.info("Scheduler: processing due scheduled ad id=%d ('%s')", ad.id, ad.name)
+            if not ad.meta_campaign_id:
+                pub_res = publish_ad_to_meta(ad)
+                if pub_res.get("success"):
+                    ad.meta_ad_account_id = pub_res.get("meta_ad_account_id")
+                    ad.meta_campaign_id = pub_res.get("meta_campaign_id")
+                    ad.meta_adset_id = pub_res.get("meta_adset_id")
+                    ad.meta_creative_id = pub_res.get("meta_creative_id")
+                    ad.meta_ad_id = pub_res.get("meta_ad_id")
+                    ad.meta_publish_status = "published"
+                    ad.meta_published_at = datetime.utcnow()
+                    ad.status = "paused"  # Keep PAUSED on Meta by default
+                    db.commit()
+                else:
+                    ad.meta_publish_status = "failed"
+                    ad.meta_error_message = pub_res.get("error")
+                    db.commit()
+            else:
+                ad.status = "paused"
+                db.commit()
+
+    except Exception as exc:
+        logger.error("Scheduler: error in check_due_scheduled_ads: %s", exc)
+        db.rollback()
+    finally:
+        db.close()
+
+
+def sync_all_meta_ads_job() -> None:
+    """
+    Periodic background job that synchronizes live Meta object statuses and performance insights
+    for all published Meta ads.
+    Runs with max_instances=1 to prevent concurrent or overlapping runs.
+    """
+    from app.agents.meta_ads_manager import auto_sync_all_ads
+    db = SessionLocal()
+    try:
+        auto_sync_all_ads(db)
+    except Exception as exc:
+        logger.error("Scheduler: error in sync_all_meta_ads_job: %s", exc)
+    finally:
+        db.close()
+
+
 def start_scheduler() -> BackgroundScheduler:
     """
     Create, configure and start the APScheduler BackgroundScheduler.
@@ -127,16 +202,37 @@ def start_scheduler() -> BackgroundScheduler:
     scheduler = BackgroundScheduler(timezone="UTC")
     scheduler.add_job(
         check_due_posts,
-        trigger=IntervalTrigger(seconds=60, timezone="UTC"),
+        trigger=IntervalTrigger(seconds=10, timezone="UTC"),
         id="check_due_posts",
         name="Check and publish due scheduled posts",
         replace_existing=True,
         max_instances=1,   # prevent overlapping runs
     )
-    scheduler.start()
-    logger.info("Scheduler started — checking for due posts every 60 s")
 
-    # Catch overdue posts immediately on startup (server-restart safety)
+    scheduler.add_job(
+        check_due_scheduled_ads,
+        trigger=IntervalTrigger(seconds=30, timezone="UTC"),
+        id="check_due_scheduled_ads",
+        name="Check due scheduled ad campaigns",
+        replace_existing=True,
+        max_instances=1,
+    )
+
+    scheduler.add_job(
+        sync_all_meta_ads_job,
+        trigger=IntervalTrigger(minutes=15, timezone="UTC"),
+        id="sync_all_meta_ads_job",
+        name="Periodic Meta Ads status & insights auto-sync",
+        replace_existing=True,
+        max_instances=1,
+    )
+
+    scheduler.start()
+    logger.info("Scheduler started — posts (10s), scheduled ads (30s), Meta ads auto-sync (15m)")
+
+    # Catch overdue posts & ads immediately on startup (server-restart safety)
     check_due_posts()
+    check_due_scheduled_ads()
 
     return scheduler
+

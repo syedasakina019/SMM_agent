@@ -26,3 +26,12 @@ venv/
 # OS
 .DS_Store
 Thumbs.db
+
+# Local database
+*.db
+
+# Uploaded media
+backend/uploads/
+
+# Local scratch files
+scratch/
