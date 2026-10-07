@@ -74,22 +74,28 @@ def _map_cta(cta: str | None) -> str:
 from pathlib import Path
 
 def _get_public_image_url(image_path: str | None) -> str:
-    """Converts local image path to public URL accessible by Meta crawlers."""
+    """Converts local image path to public HTTPS URL accessible by Meta crawlers."""
     fallback_url = "https://dummyimage.com/1024x1024/6366f1/ffffff.png"
     if not image_path:
         return fallback_url
+        
     if image_path.startswith("http://") or image_path.startswith("https://"):
+        if "localhost" in image_path or "127.0.0.1" in image_path:
+            raise ValueError("A public HTTPS URL is required for Meta publishing. Found localhost/127.0.0.1 in image path.")
         return image_path
 
     backend_base = os.getenv("BACKEND_BASE_URL", "").rstrip("/")
-    if backend_base:
-        clean_path = image_path if image_path.startswith("/") else f"/{image_path}"
-        rel_filename = clean_path.replace("/uploads/", "").lstrip("/")
-        local_file = Path("uploads") / rel_filename
-        if local_file.exists():
-            return f"{backend_base}{clean_path}"
+    if not backend_base:
+        raise ValueError("BACKEND_BASE_URL environment variable is missing. A public backend URL (like ngrok) is required for Meta publishing.")
+        
+    if "localhost" in backend_base or "127.0.0.1" in backend_base:
+        raise ValueError(f"BACKEND_BASE_URL '{backend_base}' is invalid for Meta. A public HTTPS URL (like ngrok) is required.")
 
-    return fallback_url
+    if not backend_base.startswith("https://"):
+        raise ValueError(f"BACKEND_BASE_URL '{backend_base}' must start with https:// for Meta to access images.")
+
+    clean_path = image_path if image_path.startswith("/") else f"/{image_path}"
+    return f"{backend_base}{clean_path}"
 
 
 def create_meta_campaign(creds: dict, name: str, objective: str) -> dict:
@@ -122,6 +128,36 @@ def create_meta_campaign(creds: dict, name: str, objective: str) -> dict:
     }
 
 
+def _get_ad_account_currency_multiplier(creds: dict) -> int:
+    """
+    Fetches the ad account currency from Meta API to determine the correct minor unit multiplier.
+    Defaults to 100 (e.g., cents) for most currencies.
+    """
+    url = f"https://graph.facebook.com/v19.0/{creds['ad_account_id']}"
+    params = {
+        "fields": "currency",
+        "access_token": creds["access_token"]
+    }
+    
+    try:
+        resp = http.get(url, params=params, timeout=10)
+        data = resp.json()
+        if resp.ok and "currency" in data:
+            currency = data["currency"].upper()
+            # Zero-decimal currencies
+            if currency in ["JPY", "KRW", "CLP", "PYG", "VND", "VUV", "XAF", "XOF", "XPF"]:
+                return 1
+            # Three-decimal currencies
+            elif currency in ["TND", "BHD", "JOD", "KWD", "OMR"]:
+                return 1000
+            # Default for USD, EUR, GBP, PKR, etc.
+            return 100
+    except Exception as e:
+        print(f"[WARNING - meta_ads] Failed to fetch ad account currency, defaulting to multiplier 100. Error: {e}")
+        
+    return 100  # Safe fallback for most major currencies
+
+
 def create_meta_adset(creds: dict, campaign_id: str, ad) -> dict:
     """
     Creates a Meta Ad Set under the specified Campaign.
@@ -129,11 +165,12 @@ def create_meta_adset(creds: dict, campaign_id: str, ad) -> dict:
     """
     url = f"https://graph.facebook.com/v19.0/{creds['ad_account_id']}/adsets"
 
-    # Daily budget in sub-units (e.g. cents/paisa). Default to minimum 500 sub-units if daily_budget <= 0
-    daily_budget = float(ad.daily_budget or 300.0)
-    budget_subunit = int(daily_budget * 100)
-    if budget_subunit < 30000:
-        budget_subunit = 30000  # Minimum PKR 300 (30,000 sub-units) required by Meta Ads API
+    # Fetch currency multiplier to correctly calculate minor units (subunits)
+    multiplier = _get_ad_account_currency_multiplier(creds)
+    
+    # Convert daily budget to sub-units based on account currency (e.g. cents for USD)
+    daily_budget = float(ad.daily_budget or 10.0)  # Safe fallback if 0
+    budget_subunit = int(daily_budget * multiplier)
 
     start_time = datetime.utcnow() + timedelta(minutes=5)
     start_time_iso = start_time.strftime("%Y-%m-%dT%H:%M:%S+0000")

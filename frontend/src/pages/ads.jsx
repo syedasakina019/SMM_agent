@@ -721,13 +721,23 @@ export default function AdsManager() {
   };
 
   const handleTogglePause = async (ad) => {
-    const newStatus = ad.status === "active" ? "paused" : "active";
+    const isPublished = !!ad.meta_campaign_id;
+    const isCurrentlyActive = ad.status === "active";
+    const newLocalStatus = isCurrentlyActive ? "paused" : "active";
+
     try {
-      await updateAd(ad.id, { status: newStatus });
+      if (isPublished) {
+        // Send actual pause/resume command to Meta
+        const action = isCurrentlyActive ? "pause" : "resume";
+        await updateAdMetaStatus(ad.id, { action, target: 'campaign' });
+      } else {
+        // Just update local draft/scheduled status
+        await updateAd(ad.id, { status: newLocalStatus });
+      }
       await loadAdsData();
     } catch (err) {
       console.error("Toggle status error:", err);
-      alert("Failed to update status.");
+      alert(err.message || "Failed to update status.");
     }
   };
 
